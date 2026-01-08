@@ -368,19 +368,19 @@ def probExtractor(drug_id, edge_index, rel_index, shortest_paths, num_rel, fixed
     g.add_edges_from(edge_index.transpose(1, 0).tolist())
 
     if not os.path.exists(pagerank_path):
-        pagerank = np.array(google_matrix(g), dtype='float32')
-        page_dict = {}
-        for d in drug_id:
-            page_dict[d] = list(pagerank[list(g.nodes()).index(int(d))])
-        with open(pagerank_path, 'w') as f:
-            json.dump(page_dict, f)
+        # We compute probabilities on the fly to avoid OOM
+        pass
     else:
-        with open(pagerank_path, 'r') as f:
-            page_dict = json.load(f)
-        f.close()
-
+        # We ignore the saved file to ensure consistent behavior with on-the-fly calculation
+        pass
 
     undirected_rel_index = torch.cat((rel_index, rel_index), 0)
+
+    # Precompute for probability calculation
+    nodes_list = list(g.nodes())
+    node_to_idx = {n: i for i, n in enumerate(nodes_list)}
+    N = len(nodes_list)
+    alpha = 0.85
 
     num_rel_update = []
     max_degree = []
@@ -388,16 +388,30 @@ def probExtractor(drug_id, edge_index, rel_index, shortest_paths, num_rel, fixed
     for d in drug_id:
         subsets = [int(d)]
 
+        # Calculate probability vector on the fly
+        cur_node = int(d)
+        p = np.full(N, (1.0 - alpha) / N, dtype='float32')
+        
+        if g.has_node(cur_node) and g.out_degree(cur_node) > 0:
+            successors = list(g.successors(cur_node))
+            w = alpha / len(successors)
+            for n in successors:
+                 if n in node_to_idx:
+                     p[node_to_idx[n]] += w
+        else:
+            # Dangling node -> uniform distribution
+            p.fill(1.0 / N)
+
         neighbors = np.random.choice(
-            a=list(g.nodes()),
+            a=nodes_list,
             size=fixed_num,
             replace=False,
-            p=page_dict[d])
+            p=p)
 
         subsets.extend(neighbors)
         subsets = list(set(subsets))
 
-        print(subsets)
+        # print(subsets)
 
         mapping_list = [False for _ in subsets]
         mapping_idx = subsets.index(int(d))
