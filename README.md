@@ -54,7 +54,7 @@ python main.py
 ```
 or
 ```
-python main.py -dataset drugbank/kegg/ogbl-biokg -extractor khop-subtree/randomWalk/probability
+python main.py --dataset drugbank/kegg/ogbl-biokg --extractor khop-subtree/randomWalk/probability
 ```
 
 The hyper-parameters used to train TIGER on above three datasets are shown in our paper.
