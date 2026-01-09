@@ -222,6 +222,11 @@ def main(args = None, k_fold = 5):
     data, labels, smile_graph, node_graph, dataset_statistics = load_data(args)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # CUDA性能优化设置
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True  # 优化卷积操作
+        torch.backends.cudnn.deterministic = False  # 允许非确定性算法以获得更好性能
 
     setup_seed(42)
     ##split datasets
@@ -233,9 +238,22 @@ def main(args = None, k_fold = 5):
         test_data = DTADataset(x=data[test_idx], y=labels[test_idx], sub_graph=node_graph, smile_graph=smile_graph)
         eval_data = DTADataset(x=data[val_idx], y=labels[val_idx], sub_graph=node_graph, smile_graph=smile_graph)
 
-        train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, collate_fn=collate)  ##用DataLoader加载的数据，index是会自动增加的！！
-        test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=True, collate_fn=collate)  ##用DataLoader加载的数据，index是会自动增加的！！
-        eval_loader = torch.utils.data.DataLoader(eval_data, batch_size=args.batch_size, shuffle=True, collate_fn=collate)  ##用DataLoader加载的数据，index是会自动增加的！！
+        # 优化数据加载性能：使用多进程和固定内存
+        num_workers = min(4, os.cpu_count() or 1)  # 使用4个worker，避免过多进程开销
+        pin_memory = torch.cuda.is_available()  # 固定内存加速CPU到GPU传输
+        
+        train_loader = torch.utils.data.DataLoader(
+            train_data, batch_size=args.batch_size, shuffle=True, collate_fn=collate,
+            num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0
+        )
+        test_loader = torch.utils.data.DataLoader(
+            test_data, batch_size=args.batch_size, shuffle=False, collate_fn=collate,
+            num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0
+        )
+        eval_loader = torch.utils.data.DataLoader(
+            eval_data, batch_size=args.batch_size, shuffle=False, collate_fn=collate,
+            num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0
+        )
 
         if args.model_name:
             model, optimizer = init_model(args, dataset_statistics)

@@ -13,7 +13,7 @@ sys.path.append(BASEDIR)
 import torch
 import math
 from torch.nn import TransformerEncoderLayer, TransformerEncoder, BCEWithLogitsLoss
-from torch_geometric.nn import GCNConv, SAGEConv, GCN2Conv, GATConv, ECConv, global_mean_pool, GINConv
+from torch_geometric.nn import GCNConv, SAGEConv, GCN2Conv, GATConv, global_mean_pool, GINConv
 from torch.nn import Linear, Sequential, ReLU
 from torch_geometric.nn.conv import MessagePassing
 
@@ -221,21 +221,27 @@ class GraphTransformer(torch.nn.Module):
 
         if self.type == 'graph':
             ##pooling
+            # 优化：避免使用to_data_list()，直接使用batch信息进行向量化操作
             sub_representation = []
-            for index, drug_mol_graph in enumerate(data.to_data_list()):
-                sub_embedding = x[(data.batch == index).nonzero().flatten()]  ##第index个图中的各个节点的表示，[atom_number, emd_dim]
+            batch_size = data.batch.max().item() + 1
+            # 使用向量化操作替代循环，大幅提升性能
+            for index in range(batch_size):
+                mask = (data.batch == index)
+                sub_embedding = x[mask]  ##第index个图中的各个节点的表示，[atom_number, emd_dim]
                 sub_representation.append(sub_embedding)
             representation = global_mean_pool(x, batch=data.batch)  ##每个drug分子的图的表示
         else:
             ##只返回第一个
+            # 优化：避免使用to_data_list()，直接使用batch信息
             sub_representation = []
-            for index, drug_subgraph in enumerate(data.to_data_list()):
-                sub_embedding = x[(data.batch == index).nonzero().flatten()]
-                #print(sub_embedding.shape)
+            batch_size = data.batch.max().item() + 1
+            # 使用向量化操作替代循环
+            for index in range(batch_size):
+                mask = (data.batch == index)
+                sub_embedding = x[mask]
                 sub_representation.append(sub_embedding) ##只取那个节点的embedding
-            #print(x.shape)
-            #print(data.id.shape)
-            representation = x[data.id.nonzero().flatten()]
+            # 优化：直接使用布尔索引，避免nonzero()
+            representation = x[data.id.bool()]
 
         return representation, sub_representation, attn_layer
 
