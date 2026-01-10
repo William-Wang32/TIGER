@@ -58,6 +58,26 @@ def init_args(user_args=None):
     parser.add_argument('--sub_coeff', type=float, default=0.1)
     parser.add_argument('--mi_coeff', type=float, default=0.1)
 
+    # MI objective (not about dual-channel fusion)
+    # - bce: discriminator-based BCE (repo baseline)
+    # - infonce: in-batch InfoNCE (recommended)
+    parser.add_argument('--mi_objective', type=str, default='bce', choices=['bce', 'infonce'])
+    parser.add_argument('--mi_temp', type=float, default=0.2, help='Temperature for InfoNCE (when mi_objective=infonce).')
+
+    # GraphTransformer attention normalization (not about dual-channel fusion)
+    # - softmax: neighborhood-wise softmax attention (recommended)
+    # - ratio  : legacy ratio-based normalization (kept for ablations)
+    parser.add_argument('--attn_norm', type=str, default='softmax', choices=['softmax', 'ratio'])
+    parser.add_argument('--attn_dropout', type=float, default=0.1, help='Dropout on attention weights.')
+    parser.add_argument('--edge_dropout', type=float, default=0.0, help='DropEdge rate on sp_edge_index.')
+
+    # fusion (dual-channel)
+    # - concat: baseline in this repo (concatenate two channel embeddings then MLP)
+    # - gated : adaptive gated fusion (learn per-drug gate to reweight channels)
+    parser.add_argument('--fusion', type=str, default='concat', choices=['concat', 'gated'])
+    parser.add_argument('--gate_coeff', type=float, default=0.0,
+                        help='Entropy regularization coefficient for the gate (only effective when fusion=gated).')
+
     parser.add_argument('--s_type', type=str, default='random')
 
     args = parser.parse_args()
@@ -203,6 +223,13 @@ def init_model(args, dataset_statistics):
                       max_degree_node = dataset_statistics['max_degree_node'],
                       sub_coeff=args.sub_coeff,
                       mi_coeff=args.mi_coeff,
+                      mi_objective=args.mi_objective,
+                      mi_temp=args.mi_temp,
+                      fusion=args.fusion,
+                      gate_coeff=args.gate_coeff,
+                      attn_norm=args.attn_norm,
+                      attn_dropout=args.attn_dropout,
+                      edge_dropout=args.edge_dropout,
                       dropout=args.dropout,
                       device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
 
@@ -222,11 +249,6 @@ def main(args = None, k_fold = 5):
     data, labels, smile_graph, node_graph, dataset_statistics = load_data(args)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # CUDA性能优化设置
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True  # 优化卷积操作
-        torch.backends.cudnn.deterministic = False  # 允许非确定性算法以获得更好性能
 
     setup_seed(42)
     ##split datasets
@@ -238,22 +260,9 @@ def main(args = None, k_fold = 5):
         test_data = DTADataset(x=data[test_idx], y=labels[test_idx], sub_graph=node_graph, smile_graph=smile_graph)
         eval_data = DTADataset(x=data[val_idx], y=labels[val_idx], sub_graph=node_graph, smile_graph=smile_graph)
 
-        # 优化数据加载性能：使用多进程和固定内存
-        num_workers = min(4, os.cpu_count() or 1)  # 使用4个worker，避免过多进程开销
-        pin_memory = torch.cuda.is_available()  # 固定内存加速CPU到GPU传输
-        
-        train_loader = torch.utils.data.DataLoader(
-            train_data, batch_size=args.batch_size, shuffle=True, collate_fn=collate,
-            num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0
-        )
-        test_loader = torch.utils.data.DataLoader(
-            test_data, batch_size=args.batch_size, shuffle=False, collate_fn=collate,
-            num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0
-        )
-        eval_loader = torch.utils.data.DataLoader(
-            eval_data, batch_size=args.batch_size, shuffle=False, collate_fn=collate,
-            num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0
-        )
+        train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, collate_fn=collate)  ##用DataLoader加载的数据，index是会自动增加的！！
+        test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=True, collate_fn=collate)  ##用DataLoader加载的数据，index是会自动增加的！！
+        eval_loader = torch.utils.data.DataLoader(eval_data, batch_size=args.batch_size, shuffle=True, collate_fn=collate)  ##用DataLoader加载的数据，index是会自动增加的！！
 
         if args.model_name:
             model, optimizer = init_model(args, dataset_statistics)

@@ -13,13 +13,48 @@ sys.path.append(BASEDIR)
 import torch
 import math
 from torch.nn import TransformerEncoderLayer, TransformerEncoder, BCEWithLogitsLoss
-from torch_geometric.nn import GCNConv, SAGEConv, GCN2Conv, GATConv, global_mean_pool, GINConv
+from torch_geometric.nn import GCNConv, SAGEConv, GCN2Conv, GATConv, ECConv, global_mean_pool, GINConv
 from torch.nn import Linear, Sequential, ReLU
 from torch_geometric.nn.conv import MessagePassing
 
+# We deliberately avoid `torch_geometric.utils.softmax` here.
+# In some CUDA/PyTorch combinations (typically: newer GPU + older CUDA/NVRTC),
+# the scripted softmax path can trigger NVRTC JIT compilation and fail with:
+#   nvrtc: error: invalid value for --gpu-architecture (-arch)
+# A pure eager scatter-softmax avoids TorchScript/NVRTC entirely.
+try:
+    from torch_scatter import scatter_max, scatter_add
+except Exception as e:  # pragma: no cover
+    scatter_max = scatter_add = None
+    _torch_scatter_import_error = e
+
+
+def segment_softmax(src: torch.Tensor, index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    """Neighborhood softmax over edges grouped by `index`.
+
+    Args:
+        src: [E] or [E, H] logits.
+        index: [E] target node indices.
+        num_nodes: number of target nodes.
+
+    Returns:
+        softmax(src) grouped by index, same shape as src.
+    """
+    if scatter_max is None or scatter_add is None:  # pragma: no cover
+        raise ImportError(
+            "torch_scatter is required for segment_softmax, but import failed: "
+            f"{_torch_scatter_import_error}"
+        )
+    # scatter_max supports src with extra dims, returning [num_nodes, ...]
+    max_per, _ = scatter_max(src, index, dim=0, dim_size=num_nodes)
+    out = torch.exp(src - max_per[index])
+    denom = scatter_add(out, index, dim=0, dim_size=num_nodes)
+    return out / (denom[index] + 1e-16)
+
 
 class GraphTransformerEncode(torch.nn.Module):
-    def __init__(self, num_heads, in_dim, dim_forward, rel_encoder, spatial_encoder, dropout):
+    def __init__(self, num_heads, in_dim, dim_forward, rel_encoder, spatial_encoder, dropout,
+                 attn_norm: str = 'ratio', attn_dropout: float = 0.0, edge_dropout: float = 0.0):
         super(GraphTransformerEncode, self).__init__()
 
         self.num_heads = num_heads
@@ -32,7 +67,15 @@ class GraphTransformerEncode(torch.nn.Module):
             Linear(self.dim_forward, self.in_dim)
         )
 
-        self.multiHeadAttention = MultiheadAttention(dim_model = self.in_dim, num_heads = self.num_heads, rel_encoder=rel_encoder, spatial_encoder = spatial_encoder)
+        self.multiHeadAttention = MultiheadAttention(
+            dim_model=self.in_dim,
+            num_heads=self.num_heads,
+            rel_encoder=rel_encoder,
+            spatial_encoder=spatial_encoder,
+            attn_norm=attn_norm,
+            attn_dropout=attn_dropout,
+            edge_dropout=edge_dropout,
+        )
 
         self.layernorm1 = torch.nn.LayerNorm(normalized_shape=in_dim, eps=1e-6)
         self.layernorm2 = torch.nn.LayerNorm(normalized_shape=in_dim, eps=1e-6)
@@ -87,7 +130,21 @@ class SpatialEncoding(torch.nn.Module):
 
 
 class MultiheadAttention(MessagePassing):
-    def __init__(self, dim_model, num_heads, rel_encoder, spatial_encoder, **kwargs):
+    """Relation-aware multi-head attention on a (sub)graph.
+
+    This repo's original implementation produced an edge-wise score and then used a
+    global denominator ("ratio" mode). It also passed edge weights into propagate()
+    without overriding message(), meaning the weights were **not applied**.
+
+    Improvement here:
+      1) Correctly apply edge weights via a message() function.
+      2) Provide a principled neighborhood-wise softmax normalization ("softmax" mode)
+         that matches standard Transformer/GAT-style attention.
+      3) Optional DropEdge and attention dropout for regularization.
+    """
+
+    def __init__(self, dim_model, num_heads, rel_encoder, spatial_encoder,
+                 attn_norm: str = 'ratio', attn_dropout: float = 0.0, edge_dropout: float = 0.0, **kwargs):
         kwargs.setdefault('aggr', 'add')
         super().__init__(**kwargs)
 
@@ -101,6 +158,12 @@ class MultiheadAttention(MessagePassing):
         )
 
         self.spatial_encoding = spatial_encoder
+
+        if attn_norm not in {'ratio', 'softmax'}:
+            raise ValueError(f"attn_norm must be one of {{'ratio','softmax'}}, got {attn_norm}")
+        self.attn_norm = attn_norm
+        self.attn_dropout = float(attn_dropout)
+        self.edge_dropout = float(edge_dropout)
 
 
         assert dim_model % num_heads == 0
@@ -121,6 +184,10 @@ class MultiheadAttention(MessagePassing):
         self.wk.reset_parameters()
         self.wv.reset_parameters()
         self.dense.reset_parameters()
+
+    def message(self, x_j, edge_weight):
+        # Apply edge-wise attention weights.
+        return x_j * edge_weight.view(-1, 1)
 
     def softmax_kernel_transformation(self, data, is_query, projection_matrix=None, numerical_stabilizer=0.000001):
         data_normalizer = 1.0 / torch.sqrt(torch.sqrt(torch.tensor(data.shape[-1], dtype=torch.float32)))
@@ -154,41 +221,65 @@ class MultiheadAttention(MessagePassing):
 
     def forward(self, x, sp_edge_index, sp_value, edge_rel):
 
-        rel_embedding = self.rel_embedding(edge_rel)
-        q = self.wq(x)
-        k = self.wk(x)
-        v = self.wv(x).view(x.shape[0],self.num_heads,self.depth) ##[nodes_num, num_heads, depth]
+        # Optional DropEdge (applied consistently to index/value/rel).
+        if self.edge_dropout > 0 and self.training:
+            e = sp_edge_index.shape[1]
+            keep = torch.rand(e, device=sp_edge_index.device) >= self.edge_dropout
+            sp_edge_index = sp_edge_index[:, keep]
+            sp_value = sp_value[keep]
+            edge_rel = edge_rel[keep]
 
-        row, col = sp_edge_index
-        query_end, key_start = q[col], k[row] ##[edge_nums, num_heads, depths]
-        query_end += rel_embedding
-        key_start += rel_embedding
+        rel_embedding = self.rel_embedding(edge_rel)  # [E, d_model]
 
-        query_end = query_end.view(sp_edge_index.shape[1],self.num_heads,self.depth)
-        key_start = key_start.view(sp_edge_index.shape[1],self.num_heads,self.depth)
+        n = x.shape[0]
+        # Project to multi-head
+        q = self.wq(x).view(n, self.num_heads, self.depth)
+        k = self.wk(x).view(n, self.num_heads, self.depth)
+        v = self.wv(x).view(n, self.num_heads, self.depth)
 
-        edge_attn_num = torch.einsum("ehd,ehd->eh", query_end, key_start) ##[edge_nums, num_heads]
-        data_normalizer = 1.0 / torch.sqrt(torch.sqrt(torch.tensor(edge_attn_num.shape[-1], dtype=torch.float32)))
-        edge_attn_num *= data_normalizer
-        edge_attn_bias = self.spatial_encoding(sp_value)
-        edge_attn_num += edge_attn_bias
+        row, col = sp_edge_index  # row: source, col: target
+        rel = rel_embedding.view(-1, self.num_heads, self.depth)
 
-        attn_normalizer = self.denominator(q.view(x.shape[0],self.num_heads,self.depth), k.view(x.shape[0],self.num_heads,self.depth))
-        edge_attn_dem = attn_normalizer[col] ##[edge_nums, num_heads]
-        attention_weight = edge_attn_num / edge_attn_dem ##[edge_nums, num_heads] ##scaled
+        q_e = q[col] + rel
+        k_e = k[row] + rel
+
+        # Scaled dot-product attention logits
+        logits = torch.einsum('ehd,ehd->eh', q_e, k_e) / math.sqrt(self.depth)  # [E, H]
+        logits = logits + self.spatial_encoding(sp_value)  # broadcast [E,1] -> [E,H]
+
+
+        if self.attn_norm == 'softmax':
+            # Neighborhood-wise softmax grouped by target node 'col'.
+            # Use eager scatter-softmax to avoid TorchScript/NVRTC issues.
+            attn_w = segment_softmax(logits, col, num_nodes=n)
+        else:
+            # Backward-compatible "ratio" mode: normalize with a global denominator.
+            # Note: This is *not* a probability simplex; use softmax for principled attention.
+            attn_normalizer = self.denominator(q, k)  # [N, H]
+            attn_w = logits / (attn_normalizer[col] + 1e-9)
+
+        if self.attn_dropout > 0:
+            attn_w = torch.nn.functional.dropout(attn_w, p=self.attn_dropout, training=self.training)
 
         outputs = []
-        for i in range(self.num_heads):
-            output_per_head = self.propagate(edge_index=sp_edge_index, x = v[:,i,:], edge_weight = attention_weight[:, i], size=None)
-            outputs.append(output_per_head)
+        for h in range(self.num_heads):
+            out_h = self.propagate(edge_index=sp_edge_index, x=v[:, h, :], edge_weight=attn_w[:, h], size=None)
+            outputs.append(out_h)
 
-        out = torch.cat(outputs,dim=-1)
-
-        return self.dense(out), attention_weight
+        out = torch.cat(outputs, dim=-1)
+        return self.dense(out), attn_w
 
 
 class GraphTransformer(torch.nn.Module):
-    def __init__(self, layer_num = 3, embedding_dim = 64, num_heads = 4, num_rel = 10, dropout = 0.2, type = 'graph'): ##type指示的是graph还是node，也就是对应的是图级别的表示学习，还是节点级别的表示学习
+    def __init__(self, layer_num=3, embedding_dim=64, num_heads=4, num_rel=10, dropout=0.2, type='graph',
+                 attn_norm: str = 'ratio', attn_dropout: float = 0.0, edge_dropout: float = 0.0):
+        """GraphTransformer backbone.
+
+        Args:
+            attn_norm: 'ratio' (original) or 'softmax' (recommended).
+            attn_dropout: dropout on attention weights.
+            edge_dropout: DropEdge rate on sp_edge_index.
+        """
         super(GraphTransformer, self).__init__()
 
         self.type = type
@@ -198,7 +289,8 @@ class GraphTransformer(torch.nn.Module):
         self.encoder = torch.nn.ModuleList()
         for i in range(layer_num - 1):
             self.encoder.append(GraphTransformerEncode(num_heads = num_heads, in_dim = embedding_dim, dim_forward = embedding_dim*2,
-                                                       rel_encoder = self.rel_encoder, spatial_encoder = self.spatial_encoder, dropout=dropout))
+                                                       rel_encoder = self.rel_encoder, spatial_encoder = self.spatial_encoder, dropout=dropout,
+                                                       attn_norm=attn_norm, attn_dropout=attn_dropout, edge_dropout=edge_dropout))
 
     def reset_parameters(self):
         for e in self.encoder:
@@ -221,27 +313,21 @@ class GraphTransformer(torch.nn.Module):
 
         if self.type == 'graph':
             ##pooling
-            # 优化：避免使用to_data_list()，直接使用batch信息进行向量化操作
             sub_representation = []
-            batch_size = data.batch.max().item() + 1
-            # 使用向量化操作替代循环，大幅提升性能
-            for index in range(batch_size):
-                mask = (data.batch == index)
-                sub_embedding = x[mask]  ##第index个图中的各个节点的表示，[atom_number, emd_dim]
+            for index, drug_mol_graph in enumerate(data.to_data_list()):
+                sub_embedding = x[(data.batch == index).nonzero().flatten()]  ##第index个图中的各个节点的表示，[atom_number, emd_dim]
                 sub_representation.append(sub_embedding)
             representation = global_mean_pool(x, batch=data.batch)  ##每个drug分子的图的表示
         else:
             ##只返回第一个
-            # 优化：避免使用to_data_list()，直接使用batch信息
             sub_representation = []
-            batch_size = data.batch.max().item() + 1
-            # 使用向量化操作替代循环
-            for index in range(batch_size):
-                mask = (data.batch == index)
-                sub_embedding = x[mask]
+            for index, drug_subgraph in enumerate(data.to_data_list()):
+                sub_embedding = x[(data.batch == index).nonzero().flatten()]
+                #print(sub_embedding.shape)
                 sub_representation.append(sub_embedding) ##只取那个节点的embedding
-            # 优化：直接使用布尔索引，避免nonzero()
-            representation = x[data.id.bool()]
+            #print(x.shape)
+            #print(data.id.shape)
+            representation = x[data.id.nonzero().flatten()]
 
         return representation, sub_representation, attn_layer
 
