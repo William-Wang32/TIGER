@@ -10,7 +10,7 @@ echo "========================================="
 echo ""
 echo "[1/3] 运行 randomWalk extractor..."
 echo "----------------------------------------"
-python main.py --dataset ogbl-biokg --extractor randomWalk
+python main.py --dataset ogbl-biokg --extractor randomWalk --attn_norm ratio --attn_dropout 0.0 --edge_dropout 0.0 --mi_objective bce
 if [ $? -ne 0 ]; then
     echo "错误: randomWalk 实验失败"
     exit 1
@@ -21,7 +21,7 @@ echo "✓ randomWalk 实验完成"
 echo ""
 echo "[2/3] 运行 khop-subtree extractor..."
 echo "----------------------------------------"
-python main.py --dataset ogbl-biokg --extractor khop-subtree
+python main.py --dataset ogbl-biokg --extractor khop-subtree --attn_norm ratio --attn_dropout 0.0 --edge_dropout 0.0 --mi_objective bce
 if [ $? -ne 0 ]; then
     echo "错误: khop-subtree 实验失败"
     exit 1
@@ -32,7 +32,7 @@ echo "✓ khop-subtree 实验完成"
 echo ""
 echo "[3/3] 运行 probability extractor..."
 echo "----------------------------------------"
-python main.py --dataset ogbl-biokg --extractor probability
+python main.py --dataset ogbl-biokg --extractor probability --attn_norm ratio --attn_dropout 0.0 --edge_dropout 0.0 --mi_objective bce
 if [ $? -ne 0 ]; then
     echo "错误: probability 实验失败"
     exit 1
