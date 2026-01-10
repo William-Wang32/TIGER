@@ -248,7 +248,13 @@ def main(args = None, k_fold = 5):
     ##加载interactions的data
     data, labels, smile_graph, node_graph, dataset_statistics = load_data(args)
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+
+    num_workers = min(os.cpu_count() or 1, 8)
+    pin_memory = torch.cuda.is_available()
+    persistent_workers = num_workers > 0
 
     setup_seed(42)
     ##split datasets
@@ -260,9 +266,33 @@ def main(args = None, k_fold = 5):
         test_data = DTADataset(x=data[test_idx], y=labels[test_idx], sub_graph=node_graph, smile_graph=smile_graph)
         eval_data = DTADataset(x=data[val_idx], y=labels[val_idx], sub_graph=node_graph, smile_graph=smile_graph)
 
-        train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, collate_fn=collate)  ##用DataLoader加载的数据，index是会自动增加的！！
-        test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size, shuffle=True, collate_fn=collate)  ##用DataLoader加载的数据，index是会自动增加的！！
-        eval_loader = torch.utils.data.DataLoader(eval_data, batch_size=args.batch_size, shuffle=True, collate_fn=collate)  ##用DataLoader加载的数据，index是会自动增加的！！
+        train_loader = torch.utils.data.DataLoader(
+            train_data,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            collate_fn=collate,
+        )
+        test_loader = torch.utils.data.DataLoader(
+            test_data,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            collate_fn=collate,
+        )
+        eval_loader = torch.utils.data.DataLoader(
+            eval_data,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            collate_fn=collate,
+        )
 
         if args.model_name:
             model, optimizer = init_model(args, dataset_statistics)
@@ -280,8 +310,8 @@ def main(args = None, k_fold = 5):
             for i_episode in range(args.model_episodes):
                 loop = tqdm(train_loader, ncols=80)
                 loop.set_description(f'Epoch[{i_episode}/{args.model_episodes}]')
-                train_acc, train_f1, train_auc, train_aupr, train_loss = train(loop, model, optimizer)
-                eval_acc, eval_f1, eval_auc, eval_aupr, eval_loss = eval(eval_loader, model)
+                train_acc, train_f1, train_auc, train_aupr, train_loss = train(loop, model, optimizer, device)
+                eval_acc, eval_f1, eval_auc, eval_aupr, eval_loss = eval(eval_loader, model, device)
                 print(f"train_auc:{train_auc} train_aupr:{train_aupr} eval_auc:{eval_auc} eval_aupr:{eval_aupr}")
 
                 train_log['train_acc'].append(train_acc)
@@ -306,7 +336,7 @@ def main(args = None, k_fold = 5):
 
             model.load_state_dict(best_model_state)
             model.to(device)
-            test_log = test(test_loader, model) ##test_log是一个字典，里面存储着metrics
+            test_log = test(test_loader, model, device) ##test_log是一个字典，里面存储着metrics
 
             save_dir = os.path.join('./best_save/', args.model_name, args.dataset, args.extractor,
                                     "fold_{}".format(fold), "{:.5f}".format(test_log['auc']))

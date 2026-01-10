@@ -6,7 +6,17 @@ from tqdm import *
 
 # training function at each epoch
 
-def train(loop, model, optimizer):
+def _to_device(batch, device):
+    # Move a 4-tuple of pyg Data to the target device with async copy when possible.
+    return (
+        batch[0].to(device, non_blocking=True),
+        batch[1].to(device, non_blocking=True),
+        batch[2].to(device, non_blocking=True),
+        batch[3].to(device, non_blocking=True),
+    )
+
+
+def train(loop, model, optimizer, device):
     correct, total_loss = 0, 0
     model.train()
 
@@ -14,16 +24,7 @@ def train(loop, model, optimizer):
     label_all = []
 
     for data in loop:
-        if torch.cuda.is_available():
-            data_mol1 = data[0].cuda()
-            data_drug1 = data[1].cuda()
-            data_mol2 = data[2].cuda()
-            data_drug2 = data[3].cuda()
-        else:
-            data_mol1 = data[0].cpu()
-            data_drug1 = data[1].cpu()
-            data_mol2 = data[2].cpu()
-            data_drug2 = data[3].cpu()
+        data_mol1, data_drug1, data_mol2, data_drug2 = _to_device(data, device)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -44,7 +45,8 @@ def train(loop, model, optimizer):
 
     return train_acc, train_f1, train_auc, train_aupr, train_loss
 
-def eval(loader, model):
+
+def eval(loader, model, device):
     correct, total_loss = 0, 0
     model.eval()
 
@@ -53,21 +55,11 @@ def eval(loader, model):
 
     with torch.no_grad():
         for idx, data in enumerate(loader):
-            if torch.cuda.is_available():
-                data_mol1 = data[0].cuda()
-                data_drug1 = data[1].cuda()
-                data_mol2 = data[2].cuda()
-                data_drug2 = data[3].cuda()
-            else:
-                data_mol1 = data[0].cpu()
-                data_drug1 = data[1].cpu()
-                data_mol2 = data[2].cpu()
-                data_drug2 = data[3].cpu()
-
+            data_mol1, data_drug1, data_mol2, data_drug2 = _to_device(data, device)
 
             predicts, loss = model(data_mol1, data_drug1, data_mol2, data_drug2)
 
-            ##获取指标
+            # accumulate metrics
             prob_all.append(predicts)
             label_all.append(data_mol1.y)
             total_loss += loss.item() * num_graphs(data_mol1)
@@ -79,7 +71,8 @@ def eval(loader, model):
 
     return eval_acc, eval_f1, eval_auc, eval_aupr, eval_loss
 
-def test(loader, model):
+
+def test(loader, model, device):
     correct, total_loss = 0, 0
     model.eval()
 
@@ -88,20 +81,11 @@ def test(loader, model):
 
     with torch.no_grad():
         for idx, data in enumerate(loader):
-            if torch.cuda.is_available():
-                data_mol1 = data[0].cuda()
-                data_drug1 = data[1].cuda()
-                data_mol2 = data[2].cuda()
-                data_drug2 = data[3].cuda()
-            else:
-                data_mol1 = data[0].cpu()
-                data_drug1 = data[1].cpu()
-                data_mol2 = data[2].cpu()
-                data_drug2 = data[3].cpu()
+            data_mol1, data_drug1, data_mol2, data_drug2 = _to_device(data, device)
 
             predicts, loss = model(data_mol1, data_drug1, data_mol2, data_drug2)
 
-            ##获取指标
+            # accumulate metrics
             prob_all.append(predicts)
             label_all.append(data_mol1.y)
             total_loss += loss.item() * num_graphs(data_mol1)
@@ -112,11 +96,11 @@ def test(loader, model):
     prob_all = torch.concat(prob_all).cpu().detach().numpy()
     test_acc, test_f1, test_auc, test_aupr = get_score(label_all, prob_all)
 
-    return {"acc":test_acc,
-            "f1":test_f1,
-            "auc":test_auc,
-            "aupr":test_aupr,
-            "loss":test_loss}
+    return {"acc": test_acc,
+            "f1": test_f1,
+            "auc": test_auc,
+            "aupr": test_aupr,
+            "loss": test_loss}
 
 def num_graphs(data):
     if hasattr(data, 'num_graphs'):
