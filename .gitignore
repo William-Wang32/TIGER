@@ -2,6 +2,5 @@
 __pycache__/
 data/
 dataset/
-best_save/tiger/drugbank/
-best_save/tiger/kegg/
-best_save/tiger/ogbl-biokg/
+TIGER.pt
+best_save/tiger/drugbank/randomWalk/fold_0/0.85122/
